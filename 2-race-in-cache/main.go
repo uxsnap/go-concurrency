@@ -10,11 +10,14 @@ package main
 
 import (
 	"container/list"
+	"sync"
 	"testing"
 )
 
 // CacheSize determines how big the cache can grow
 const CacheSize = 100
+
+var mu sync.Mutex
 
 // KeyStoreCacheLoader is an interface for the KeyStoreCache
 type KeyStoreCacheLoader interface {
@@ -44,23 +47,53 @@ func New(load KeyStoreCacheLoader) *KeyStoreCache {
 
 // Get gets the key from cache, loads it from the source if needed
 func (k *KeyStoreCache) Get(key string) string {
+	mu.Lock()
+	defer mu.Unlock()
+
 	if e, ok := k.cache[key]; ok {
 		k.pages.MoveToFront(e)
 		return e.Value.(page).Value
 	}
+
+	var rwMut sync.RWMutex
+	pageChan := make(chan page)
+
 	// Miss - load from database and save it in cache
-	p := page{key, k.load(key)}
-	// if cache is full remove the least used item
-	if len(k.cache) >= CacheSize {
-		end := k.pages.Back()
-		// remove from map
-		delete(k.cache, end.Value.(page).Key)
-		// remove from list
-		k.pages.Remove(end)
-	}
-	k.pages.PushFront(p)
-	k.cache[key] = k.pages.Front()
-	return p.Value
+	go func() {
+		p := page{key, k.load(key)}
+
+		rwMut.Lock()
+		k.pages.PushFront(p)
+		rwMut.Unlock()
+
+		rwMut.RLock()
+		k.cache[key] = k.pages.Front()
+		rwMut.RUnlock()
+
+		pageChan <- p
+	}()
+
+	
+	go func() {
+		// if cache is full remove the least used item
+		rwMut.RLock()
+		isFull := len(k.cache) >= CacheSize
+		rwMut.RUnlock()
+
+		if isFull {
+			end := k.pages.Back()
+
+			// remove from map
+			rwMut.Lock()
+			delete(k.cache, end.Value.(page).Key)
+			k.pages.Remove(end)
+			rwMut.Unlock()
+		}
+	}()
+
+	newPage := <-pageChan
+
+	return newPage.Value
 }
 
 // Loader implements KeyStoreLoader
@@ -71,6 +104,7 @@ type Loader struct {
 // Load gets the data from the database
 func (l *Loader) Load(key string) string {
 	val, err := l.DB.Get(key)
+	
 	if err != nil {
 		panic(err)
 	}
@@ -82,6 +116,7 @@ func run(t *testing.T) (*KeyStoreCache, *MockDB) {
 	loader := Loader{
 		DB: GetMockDB(),
 	}
+
 	cache := New(&loader)
 
 	RunMockServer(cache, t)
